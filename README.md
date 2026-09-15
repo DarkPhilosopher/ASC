@@ -86,3 +86,47 @@ Example:
 
 Marks the cursor's current square as the target, then places `g`
 there (3 + 4 = 7, the 7th letter).
+
+## Points, links, and when-rules
+
+Requested directly (paraphrased): set a variable with its own name on
+a specific point, tie one point to another like a string between two
+pins, and have an exchange fire automatically the moment a watched
+variable reaches a set amount.
+
+| Command | Does |
+|---|---|
+| `/point <name>` | names the cursor's own square |
+| `/point <name> <x> <y>` | names that square instead |
+| `/set <point>.<var> <number>` | a variable of its own, private to that point (separate from the plain global `/set <name> <number>`) |
+| `/link <from> <to>` | ties a string from one point to another |
+| `/when <point>.<var> == <number>` | as soon as that's true, fires |
+| `/points` | lists your points, where they are, and their own variables |
+| `/rules` | lists your links and when-rules |
+
+**What firing does**: for every point `<from>` is linked to, it adds
+`<from>`'s own value of that SAME variable into `<to>`'s own value of
+it (`to.var = from.var + to.var` -- `to` keeps growing, `from` is left
+alone) and writes the new total onto `to`'s own square as a letter, the
+same 1=a/2=b/wraps-around mapping `/calc` uses. This is checked
+continuously, live, not just when you type something -- "as soon as"
+really means as soon as, the instant the watched variable equals its
+amount, even if nothing else happened right then. It fires once on the
+way in, not once per moment it stays true, and rearms itself the
+moment the value moves away again, ready to fire again later.
+
+Example, worked exactly:
+
+```
+/point A
+/point B 3 3
+/link A B
+/set A.zax 5
+/set B.zax 8
+/when A.zax == 5
+```
+
+Fires immediately (A.zax is already 5): `B.zax` becomes `5 + 8 = 13`,
+and the letter `m` (the 13th letter) is written onto B's own square.
+Set `A.zax` to anything else and the rule quietly rearms; set it back
+to `5` and it fires again, this time `5 + 13 = 18` -> `r`.

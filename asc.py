@@ -40,16 +40,20 @@ HISTORY_FILE = os.path.join(_HERE, "chat.log")
 
 REVERSE = "\033[7m"
 TARGET_MARK = "\033[33;4m"  # yellow + underline -- distinct from the cursor's reverse video
+POINT_MARK = "\033[36m"     # cyan -- named points; drawn before target/cursor, so those win ties
 RESET = "\033[0m"
 
 
 # ---------------------------------------------------------------------------
-# state -- just the grid and where the cursor is
+# state -- the grid, the cursor, and (added later) named points with their
+# own private variables, links tying one point to another, and when-rules
+# that watch a point's own variable and fire an exchange along its links
 # ---------------------------------------------------------------------------
 
 def new_state():
     return {"cursor_x": SIZE // 2, "cursor_y": SIZE // 2, "grid": {}, "history": [],
-            "vars": {}, "target": None}
+            "vars": {}, "target": None,
+            "points": {}, "links": [], "rules": []}
 
 
 def _key(x, y):
@@ -124,13 +128,22 @@ def clear(state):
 
 CHAT_HELP = [
     "/clear -- wipes the whole grid",
-    "/set <name> <number> -- stores a variable",
-    "/vars -- lists your variables and the current target",
+    "/set <name> <number> -- stores a global variable",
+    "/vars -- lists your global variables and the current target",
     "/target -- marks the cursor's own square as the target",
     "/target <x> <y> -- marks that square instead",
-    "/calc <a> <op> <b> -- a and b are each a variable name or a plain",
-    "  number, op is + - * or / -- the result is placed on the target",
+    "/calc <a> <op> <b> -- a and b are each a variable/point.var or a",
+    "  plain number, op is + - * or / -- result placed on the target",
     "  square as a letter (1=a, 2=b, ... wrapping past 26 back to a)",
+    "",
+    "/point <name> -- names the cursor's own square (or /point <name> <x> <y>)",
+    "/set <point>.<var> <number> -- a variable of its own, private to that point",
+    "/link <from> <to> -- ties a string from one point to another",
+    "/when <point>.<var> == <number> -- as soon as that's true, adds the",
+    "  point's own value into the SAME variable on every point it's",
+    "  linked to, and writes the new total there as a letter",
+    "/points  /rules -- list what you've made",
+    "",
     "/quit -- leaves ASC", "/help -- this",
 ]
 
@@ -143,12 +156,19 @@ OPS = {
 
 
 def _operand(state, token):
-    """token is either a plain number or an already-/set variable name.
+    """token is a plain number, an already-/set global variable name,
+    or "<point>.<var>" for one of a point's own private variables.
     Returns (value, error) -- exactly one of the two is None."""
     try:
         return float(token), None
     except ValueError:
         pass
+    if "." in token:
+        pname, vname = token.split(".", 1)
+        point = state["points"].get(pname)
+        if point is not None and vname in point["vars"]:
+            return point["vars"][vname], None
+        return None, "'%s' isn't a set point variable" % token
     if token in state["vars"]:
         return state["vars"][token], None
     return None, "'%s' isn't a number or a variable you've /set" % token
@@ -159,6 +179,55 @@ def _letter_for(n):
     so a variable that goes negative or past 26 still always lands on
     a real, placeable letter rather than erroring."""
     return chr(ord("a") + (round(n) - 1) % 26)
+
+
+# ---------------------------------------------------------------------------
+# points, links, and when-rules -- "like tying strings from one pin to
+# another": /point names a square, /link ties one point to another,
+# /when watches one point's own variable and, the moment it equals a set
+# amount, adds that point's value into every linked point's SAME-named
+# variable (own self variable, per point, not a shared global) -- and
+# writes the new total onto the linked point's own square as a letter,
+# same as /calc already does for its own single anonymous target.
+# ---------------------------------------------------------------------------
+
+def _fire_rule(state, rule):
+    from_point = state["points"][rule["point"]]
+    var = rule["var"]
+    a = from_point["vars"].get(var, 0)
+    for link_from, link_to in state["links"]:
+        if link_from != rule["point"]:
+            continue
+        to_point = state["points"].get(link_to)
+        if to_point is None:
+            continue
+        b = to_point["vars"].get(var, 0)
+        total = a + b
+        to_point["vars"][var] = total
+        letter = _letter_for(total)
+        state["grid"][_key(to_point["x"], to_point["y"])] = letter
+        _log(state, "%s.%s == %g fired -> %s.%s (%g) + %s.%s (%g) = %g, '%s' placed at %d,%d"
+             % (rule["point"], var, rule["amount"], rule["point"], var, a, link_to, var, b,
+                total, letter, to_point["x"], to_point["y"]))
+
+
+def check_rules(state):
+    """Called once every tick of the main loop (and while the chat line
+    is open too) -- "as soon as" a watched variable equals its amount,
+    not only when you happen to type a command. Fires once on the
+    transition into being true, not once per tick for as long as it
+    stays true (the "fired" flag), and rearms itself the moment the
+    value moves away from the amount again."""
+    for rule in state["rules"]:
+        point = state["points"].get(rule["point"])
+        if point is None:
+            continue
+        met = point["vars"].get(rule["var"], 0) == rule["amount"]
+        if met and not rule["fired"]:
+            rule["fired"] = True
+            _fire_rule(state, rule)
+        elif not met:
+            rule["fired"] = False
 
 
 def run_chat_line(state, said):
@@ -192,19 +261,99 @@ def run_chat_line(state, said):
                                      or "none yet -- /target"))
         return False
 
+    if said == "/points":
+        _log(state, "you: /points")
+        if not state["points"]:
+            _log(state, "no points yet -- /point <name>")
+        for name, p in state["points"].items():
+            varstr = ", ".join("%s=%g" % (k, v) for k, v in p["vars"].items()) or "no variables"
+            _log(state, "  %s at %d,%d: %s" % (name, p["x"], p["y"], varstr))
+        return False
+
+    if said == "/rules":
+        _log(state, "you: /rules")
+        if not state["links"]:
+            _log(state, "no links yet -- /link <from> <to>")
+        for a, b in state["links"]:
+            _log(state, "  %s -> %s" % (a, b))
+        if not state["rules"]:
+            _log(state, "no when-rules yet -- /when <point>.<var> == <number>")
+        for r in state["rules"]:
+            _log(state, "  when %s.%s == %g%s" % (r["point"], r["var"], r["amount"],
+                                                   " (fired)" if r["fired"] else ""))
+        return False
+
     words = said.split()
 
     if words[0] == "/set":
         _log(state, "you: " + said)
         if len(words) != 3:
-            _log(state, "try: /set <name> <number>")
+            _log(state, "try: /set <name> <number>  or  /set <point>.<var> <number>")
             return False
         try:
-            state["vars"][words[1]] = float(words[2])
+            value = float(words[2])
         except ValueError:
             _log(state, "'%s' isn't a plain number" % words[2])
             return False
-        _log(state, "%s = %g" % (words[1], state["vars"][words[1]]))
+        if "." in words[1]:
+            pname, vname = words[1].split(".", 1)
+            if pname not in state["points"]:
+                _log(state, "no point called '%s' -- /point %s first" % (pname, pname))
+                return False
+            state["points"][pname]["vars"][vname] = value
+            _log(state, "%s.%s = %g" % (pname, vname, value))
+        else:
+            state["vars"][words[1]] = value
+            _log(state, "%s = %g" % (words[1], value))
+        return False
+
+    if words[0] == "/point":
+        _log(state, "you: " + said)
+        if len(words) == 2:
+            name, x, y = words[1], state["cursor_x"], state["cursor_y"]
+        elif len(words) == 4 and words[2].isdigit() and words[3].isdigit():
+            name, x, y = words[1], int(words[2]), int(words[3])
+            if not (0 <= x < SIZE and 0 <= y < SIZE):
+                _log(state, "that's off the %dx%d grid" % (SIZE, SIZE))
+                return False
+        else:
+            _log(state, "try: /point <name>  or  /point <name> <x> <y>")
+            return False
+        state["points"].setdefault(name, {"vars": {}})
+        state["points"][name]["x"] = x
+        state["points"][name]["y"] = y
+        _log(state, "point '%s' at %d,%d" % (name, x, y))
+        return False
+
+    if words[0] == "/link":
+        _log(state, "you: " + said)
+        if len(words) != 3:
+            _log(state, "try: /link <from> <to>")
+            return False
+        a, b = words[1], words[2]
+        if a not in state["points"] or b not in state["points"]:
+            _log(state, "both need to already be points -- /point <name> first")
+            return False
+        state["links"].append((a, b))
+        _log(state, "tied %s -> %s" % (a, b))
+        return False
+
+    if words[0] == "/when":
+        _log(state, "you: " + said)
+        if len(words) != 4 or words[2] != "==" or "." not in words[1]:
+            _log(state, "try: /when <point>.<var> == <number>")
+            return False
+        pname, vname = words[1].split(".", 1)
+        if pname not in state["points"]:
+            _log(state, "no point called '%s' -- /point %s first" % (pname, pname))
+            return False
+        try:
+            amount = float(words[3])
+        except ValueError:
+            _log(state, "'%s' isn't a plain number" % words[3])
+            return False
+        state["rules"].append({"point": pname, "var": vname, "amount": amount, "fired": False})
+        _log(state, "when %s.%s == %g: adds into every point %s links to" % (pname, vname, amount, pname))
         return False
 
     if words[0] == "/target":
@@ -262,6 +411,9 @@ def render(state):
     for k, letter in state["grid"].items():
         x, y = (int(p) for p in k.split(","))
         grid[y][x] = letter
+    for p in state["points"].values():
+        px, py = p["x"], p["y"]
+        grid[py][px] = POINT_MARK + (grid[py][px] if grid[py][px] != " " else "*") + RESET
     target = state["target"]
     if target is not None and target != (state["cursor_x"], state["cursor_y"]):
         tx, ty = target
@@ -360,6 +512,7 @@ def chat_break(kb, state):
     quitting = False
     try:
         while True:
+            check_rules(state)
             draw(state)
             try:
                 said = input("> ")
@@ -382,6 +535,7 @@ def run():
     moves = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
     with Keyboard() as kb:
         while True:
+            check_rules(state)
             draw(state)
             time.sleep(0.05)
             key = kb.pressed()
